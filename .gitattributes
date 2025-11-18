@@ -1,6 +1,17 @@
-# Auto detect text files and perform LF normalization
-* text=auto
-* linguist-language=Python
+# Force all Python files to count normally
+*.py linguist-detectable=true
+*.py linguist-language=Python
+
+# Ignore build artifacts (they confuse GitHub Linguist)
+build/* linguist-vendored
+dist/* linguist-vendored
+__pycache__/* linguist-vendored
+
+# Ignore CSV files from language detection
+*.csv linguist-vendored
+
+# Ignore any TeX or HTML-like false positives
 *.tex linguist-detectable=false
 *.sty linguist-detectable=false
 *.cls linguist-detectable=false
+*.html linguist-detectable=false
