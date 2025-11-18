@@ -3,6 +3,9 @@ import os
 import csv
 import tkinter as tk
 from tkinter import ttk
+import requests
+import concurrent.futures
+from functools import lru_cache
 
 
 def main():
@@ -51,6 +54,64 @@ def main():
 
 	# Prepare a list of champion display names for autocomplete
 	champion_list = sorted({v.get('champion_id', '').strip() for v in csv_rows.values() if v.get('champion_id')}, key=lambda s: s.lower())
+
+	# --- Data Dragon integration ---
+	# Cache and helper functions to fetch champion cooldowns from ddragon
+	DDRAGON_VERSIONS_URL = "https://ddragon.leagueoflegends.com/api/versions.json"
+	DD_BASE = "https://ddragon.leagueoflegends.com/cdn"
+
+	def get_latest_dd_version(timeout=5):
+		r = requests.get(DDRAGON_VERSIONS_URL, timeout=timeout)
+		r.raise_for_status()
+		return r.json()[0]
+
+	@lru_cache(maxsize=1)
+	def load_champion_key_map(version=None, timeout=5):
+		if not version:
+			version = get_latest_dd_version(timeout=timeout)
+		url = f"{DD_BASE}/{version}/data/en_US/champion.json"
+		r = requests.get(url, timeout=timeout)
+		r.raise_for_status()
+		data = r.json().get("data", {})
+		mapping = {}
+		for key, info in data.items():
+			name = info.get('id', key)
+			mapping[name.lower()] = key
+			mapping[key.lower()] = key
+			mapping[name.replace(' ', '').lower()] = key
+		return mapping, version
+
+	@lru_cache(maxsize=256)
+	def fetch_champion_data(key, version, timeout=5):
+		url = f"{DD_BASE}/{version}/data/en_US/champion/{key}.json"
+		r = requests.get(url, timeout=timeout)
+		r.raise_for_status()
+		return r.json()["data"][key]
+
+	def get_champion_cooldowns_dd(champ_input_name, timeout=5):
+		name = (champ_input_name or '').strip()
+		if not name:
+			return None
+		mapping, version = load_champion_key_map()
+		lookup_keys = [name.lower(), name.replace(' ', '').lower()]
+		for k in lookup_keys:
+			if k in mapping:
+				champ_key = mapping[k]
+				data = fetch_champion_data(champ_key, version, timeout=timeout)
+				spells = data.get('spells', [])
+				slots = ["Q", "W", "E", "R"]
+				return {slot: spells[i].get('cooldownBurn', '-') for i, slot in enumerate(slots)}
+		# fallback startswith
+		for kname, key in mapping.items():
+			if kname.startswith(name.lower()):
+				data = fetch_champion_data(key, version, timeout=timeout)
+				spells = data.get('spells', [])
+				slots = ["Q", "W", "E", "R"]
+				return {slot: spells[i].get('cooldownBurn', '-') for i, slot in enumerate(slots)}
+		return None
+
+	# Thread pool for background fetches
+	executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 	# Shared autocomplete Listbox (one visible at a time)
 	autocomplete_box = tk.Listbox(root, height=6)
@@ -170,6 +231,11 @@ def main():
 	rows_combo.set(str(max_rows))
 	rows_combo.pack(side='left', padx=(6, 12))
 
+	# Option: use Data Dragon (online) instead of CSV
+	use_dd_var = tk.BooleanVar(value=False)
+	chk = ttk.Checkbutton(controls_frame, text='Use DDragon', variable=use_dd_var)
+	chk.pack(side='left', padx=(6, 0))
+
 	def make_row(index):
 		# index is 0-based logical row index; grid row will be base_row + index
 		grid_row = base_row + index
@@ -230,17 +296,49 @@ def main():
 			n = int(rows_combo.get())
 		except Exception:
 			n = max_rows
-		for idx in range(n):
-			val = rows[idx]['entry'].get().strip()
-			row = find_champion(val)
-			if row:
-				# set each returned field into its own label
-				for i, fld in enumerate(returned_fields):
-					v = row.get(fld, '-')
-					rows[idx]['rvs'][i].set(v)
-			else:
-				for v in rows[idx]['rvs']:
-					v.set('Champion not found')
+		if use_dd_var.get():
+			# use Data Dragon in background threads
+			def make_task(index, name):
+				def task():
+					try:
+						cds = get_champion_cooldowns_dd(name)
+					except Exception:
+						cds = None
+					def apply_result():
+						if cds:
+							# cds contains Q/W/E/R; map into returned_fields positions
+							for i, fld in enumerate(returned_fields):
+								if 'passive' in fld.lower():
+									rows[index]['rvs'][i].set('-')
+								elif fld.upper().startswith('Q'):
+									rows[index]['rvs'][i].set(cds.get('Q', '-'))
+								elif fld.upper().startswith('W'):
+									rows[index]['rvs'][i].set(cds.get('W', '-'))
+								elif fld.upper().startswith('E'):
+									rows[index]['rvs'][i].set(cds.get('E', '-'))
+								elif fld.upper().startswith('R'):
+									rows[index]['rvs'][i].set(cds.get('R', '-'))
+						else:
+							for v in rows[index]['rvs']:
+								v.set('Champion not found')
+					root.after(0, apply_result)
+				return task
+
+			for idx in range(n):
+				name = rows[idx]['entry'].get().strip()
+				executor.submit(make_task(idx, name))
+		else:
+			for idx in range(n):
+				val = rows[idx]['entry'].get().strip()
+				row = find_champion(val)
+				if row:
+					# set each returned field into its own label
+					for i, fld in enumerate(returned_fields):
+						v = row.get(fld, '-')
+						rows[idx]['rvs'][i].set(v)
+				else:
+					for v in rows[idx]['rvs']:
+						v.set('Champion not found')
 
 
 	# Global buttons
