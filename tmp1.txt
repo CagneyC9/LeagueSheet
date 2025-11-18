@@ -1,0 +1,120 @@
+
+import os
+import sys
+import shutil
+import tkinter as tk
+from tkinter import ttk
+import requests
+import concurrent.futures
+from functools import lru_cache
+from PIL import Image, ImageTk
+import io
+
+
+def main():
+	root = tk.Tk()
+	root.title('LeagueSheet - 5 Inputs Demo')
+
+	# Set window size as percentage of the screen (60% width x 60% height)
+	sw = root.winfo_screenwidth()
+	sh = root.winfo_screenheight()
+	w = int(sw * 0.60)
+	h = int(sh * 0.60)
+	# Center the window on the screen
+	x = (sw - w) // 2
+	y = (sh - h) // 2
+	root.geometry(f"{w}x{h}+{x}+{y}")
+
+	# We use Data Dragon as the authoritative source for champions/cooldowns.
+	# No CSV dependency is required.
+
+	# Prepare a list of champion display names for autocomplete.
+	# Use a per-user writable data directory so packaged exes can update the cache.
+
+	def get_user_data_dir():
+		if os.name == 'nt':
+			base = os.getenv('LOCALAPPDATA') or os.path.expanduser('~\\AppData\\Local')
+		else:
+			base = os.getenv('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
+		path = os.path.join(base, 'LeagueSheet')
+		try:
+			os.makedirs(path, exist_ok=True)
+		except Exception:
+			pass
+		return path
+
+	def resource_path(rel_path):
+		# When packaged by PyInstaller, resources are in sys._MEIPASS
+		if getattr(sys, 'frozen', False):
+			base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+		else:
+			base = os.path.dirname(os.path.abspath(__file__))
+		return os.path.join(base, rel_path)
+
+	data_dir = get_user_data_dir()
+	local_list_path = os.path.join(data_dir, 'champions.txt')
+
+	# Does it work if i do this?
+	# If the per-user champions cache is missing, try copying a bundled bootstrap.
+	# Look in the bundle root for either `champions.txt` (repo root) or `data/champions.txt`.
+	bundled_champs = resource_path('champions.txt')
+	if not os.path.exists(bundled_champs):
+		bundled_champs = resource_path(os.path.join('data', 'champions.txt'))
+	if not os.path.exists(local_list_path) and os.path.exists(bundled_champs):
+		try:
+			shutil.copyfile(bundled_champs, local_list_path)
+		except Exception:
+			pass
+
+	champion_list = []
+	if os.path.exists(local_list_path):
+		try:
+			with open(local_list_path, encoding='utf-8') as f:
+				champion_list = [line.strip() for line in f if line.strip()]
+		except Exception:
+			champion_list = []
+
+	if not champion_list:
+		# fallback: try to read from DDragon now
+		try:
+			mapping, dd_version, display_names = load_champion_key_map()
+			champion_list = display_names
+		except Exception:
+			champion_list = []
+
+	# status for champion updater (shows local/online update state)
+	status_var = tk.StringVar(value='Champion list: local (cached)')
+
+	# Thread pool for background fetches (create before any submit)
+	executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+	# Start a background task to refresh the local champions file from DDragon
+	def background_update_champion_file():
+		try:
+			# indicate update start in the UI
+			root.after(0, lambda: status_var.set('Updating champion list...'))
+			mapping, version, display_names = load_champion_key_map()
+			# write to local file
+			dirpath = os.path.dirname(local_list_path)
+			os.makedirs(dirpath, exist_ok=True)
+			with open(local_list_path, 'w', encoding='utf-8') as f:
+				for name in display_names:
+					f.write(name + '\n')
+			# update in-memory list on the main thread
+			def apply_update():
+				champion_list[:] = display_names
+				# mark success with version
+				status_var.set(f'Champion list: updated ({version})')
+			root.after(0, apply_update)
+		except Exception:
+			# show failure briefly
+			try:
+				root.after(0, lambda: status_var.set('Champion list: update failed'))
+			except Exception:
+				pass
+
+	# submit the updater but don't block startup
+	executor.submit(background_update_champion_file)
+
+	# --- Data Dragon integration ---
+	# Cache and helper functions to fetch champion cooldowns from ddragon

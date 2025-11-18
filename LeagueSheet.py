@@ -7,9 +7,12 @@ from tkinter import ttk
 import requests
 import concurrent.futures
 from functools import lru_cache
+from PIL import Image, ImageTk
+import io
 
 
 def main():
+	# Entry point for the LeagueSheet demo UI.
 	root = tk.Tk()
 	root.title('LeagueSheet - 5 Inputs Demo')
 
@@ -171,16 +174,22 @@ def main():
 				return {slot: spells[i].get('cooldownBurn', '-') for i, slot in enumerate(slots)}
 		return None
 
-	# Shared autocomplete Listbox (one visible at a time)
-	autocomplete_box = tk.Listbox(root, height=6)
-	autocomplete_box.configure(exportselection=False)
+	# Shared autocomplete Listbox with scrollbar (one visible at a time)
+	autocomplete_frame = tk.Frame(root, bd=1, relief='solid')
+	autocomplete_box = tk.Listbox(autocomplete_frame, height=6)
+	scrollbar = ttk.Scrollbar(autocomplete_frame, orient='vertical', command=autocomplete_box.yview)
+	autocomplete_box.configure(exportselection=False, yscrollcommand=scrollbar.set)
+	autocomplete_box.grid(row=0, column=0, sticky='nsew')
+	scrollbar.grid(row=0, column=1, sticky='ns')
+	autocomplete_frame.grid_rowconfigure(0, weight=1)
+	autocomplete_frame.grid_columnconfigure(0, weight=1)
 
 	# active entry holder so listbox callbacks know which Entry to fill
 	active = {'entry': None}
 
 	def show_autocomplete(entry, items):
 		if not items:
-			autocomplete_box.place_forget()
+			autocomplete_frame.place_forget()
 			return
 		autocomplete_box.delete(0, tk.END)
 		for it in items:
@@ -189,8 +198,11 @@ def main():
 		x = entry.winfo_rootx() - root.winfo_rootx()
 		y = entry.winfo_rooty() - root.winfo_rooty() + entry.winfo_height()
 		w = entry.winfo_width()
-		autocomplete_box.place(x=x, y=y, width=w)
-		autocomplete_box.lift()
+		autocomplete_frame.place(x=x, y=y, width=w + 18)  # add space for scrollbar
+		autocomplete_frame.lift()
+
+	def hide_autocomplete():
+		autocomplete_frame.place_forget()
 
 	def pick_current(event=None):
 		sel = autocomplete_box.curselection()
@@ -201,11 +213,11 @@ def main():
 		if ent:
 			ent.delete(0, tk.END)
 			ent.insert(0, val)
-		autocomplete_box.place_forget()
+		hide_autocomplete()
 
 	autocomplete_box.bind('<ButtonRelease-1>', pick_current)
 	autocomplete_box.bind('<Return>', pick_current)
-	autocomplete_box.bind('<Escape>', lambda e: autocomplete_box.place_forget())
+	autocomplete_box.bind('<Escape>', lambda e: hide_autocomplete())
 
 	def attach_autocomplete(entry):
 		def on_keyrelease(event):
@@ -220,27 +232,44 @@ def main():
 				return
 			if key in ('Return', 'Escape'):
 				if key == 'Escape':
-					autocomplete_box.place_forget()
+					hide_autocomplete()
 				return
 			text = entry.get().strip().lower()
 			if not text:
-				matches = champion_list[:50]
+				matches = champion_list
 			else:
 				matches = [c for c in champion_list if c.lower().startswith(text)]
 			if matches:
 				active['entry'] = entry
-				show_autocomplete(entry, matches[:20])
+				show_autocomplete(entry, matches)
 			else:
-				autocomplete_box.place_forget()
+				hide_autocomplete()
 
 		entry.bind('<KeyRelease>', on_keyrelease)
 		# small delay to allow clicks into the listbox to register
-		entry.bind('<FocusOut>', lambda e: root.after(150, lambda: autocomplete_box.place_forget()))
+		entry.bind('<FocusOut>', lambda e: root.after(150, hide_autocomplete))
+		entry.bind('<FocusIn>', lambda e, ent=entry: (clear_placeholder(ent), active.update({'entry': ent}), show_autocomplete(ent, champion_list)))
 
 	# No CSV lookups: DDragon is the authoritative source for champion data.
 
 	frame = ttk.Frame(root, padding=12)
 	frame.pack(fill='both', expand=True)
+
+	PLACEHOLDER_TEXT = 'Select champion'
+
+	def put_placeholder(entry):
+		entry.delete(0, tk.END)
+		entry.insert(0, PLACEHOLDER_TEXT)
+		entry._placeholder = True
+
+	def clear_placeholder(entry):
+		if getattr(entry, '_placeholder', False):
+			entry.delete(0, tk.END)
+			entry._placeholder = False
+
+	def ensure_placeholder(entry):
+		if not entry.get().strip():
+			put_placeholder(entry)
 
 	# Returned fields (we use DDragon cooldowns: Q/W/E/R)
 	returned_fields = ['Q', 'W', 'E', 'R']
@@ -248,7 +277,7 @@ def main():
 	# Header labels for the spell columns (Q/W/E/R)
 	# Place headers on row 1 so the controls_frame (row 0) does not overlap them
 	for i, fld in enumerate(returned_fields):
-		tk.Label(frame, text=fld).grid(row=1, column=2 + i, sticky='w', padx=(0, 6), pady=(0, 6))
+		tk.Label(frame, text=fld).grid(row=1, column=3 + i, sticky='w', padx=(0, 6), pady=(0, 6))
 
 	# Rows controller: allow selecting 1-5 visible rows
 	rows = []
@@ -285,6 +314,11 @@ def main():
 		lbl_name.grid(row=grid_row, column=0, sticky='w', padx=(0, 6), pady=6)
 		e = ttk.Entry(frame, width=36)
 		e.grid(row=grid_row, column=1, padx=(0, 6), pady=6)
+		put_placeholder(e)
+		e.bind('<FocusIn>', lambda ev, ent=e: clear_placeholder(ent))
+		e.bind('<FocusOut>', lambda ev, ent=e: ensure_placeholder(ent))
+		champ_icon = ttk.Label(frame)
+		champ_icon.grid(row=grid_row, column=2, padx=(0, 6), pady=6)
 
 		# attach autocomplete behavior to this entry
 		attach_autocomplete(e)
@@ -297,12 +331,12 @@ def main():
 		for i in range(len(returned_fields)):
 			v = tk.StringVar(value='')
 			# allow wider labels to accommodate descriptions
-			lbl = ttk.Label(frame, textvariable=v, width=40, anchor='w')
-			lbl.grid(row=grid_row, column=2 + i, sticky='w')
+			lbl = ttk.Label(frame, textvariable=v, width=40, anchor='w', compound='left')
+			lbl.grid(row=grid_row, column=3 + i, sticky='w')
 			val_labels.append(lbl)
 			rvs.append(v)
 
-		rows.append({'label': lbl_name, 'entry': e, 'val_labels': val_labels, 'rvs': rvs})
+		rows.append({'label': lbl_name, 'entry': e, 'icon': champ_icon, 'icon_img': None, 'val_labels': val_labels, 'rvs': rvs, 'rv_imgs': [None]*len(returned_fields)})
 
 	# create all rows (they will be shown/hidden by update_rows)
 	for i in range(max_rows):
@@ -318,12 +352,15 @@ def main():
 				# show
 				r['label'].grid()
 				r['entry'].grid()
+				r['icon'].grid()
 				for lbl in r['val_labels']:
 					lbl.grid()
 			else:
 				# hide
 				r['label'].grid_remove()
 				r['entry'].grid_remove()
+				r['icon'].configure(image='')
+				r['icon'].grid_remove()
 				for lbl in r['val_labels']:
 					lbl.grid_remove()
 				# show/hide per-row label, entry, and value labels
@@ -335,56 +372,132 @@ def main():
 			n = int(rows_combo.get())
 		except Exception:
 			n = max_rows
+
+		# gather only non-placeholder names
+		names = []
+		for r in rows:
+			name = r['entry'].get().strip()
+			if name and not getattr(r['entry'], '_placeholder', False):
+				names.append(name)
+
+		# rewrite entries so filled names are packed at the top, placeholders below
+		for i, r in enumerate(rows):
+			r['entry'].delete(0, tk.END)
+			if i < len(names):
+				r['entry'].insert(0, names[i])
+				r['entry']._placeholder = False
+			else:
+				put_placeholder(r['entry'])
+				for v in r['rvs']:
+					v.set('')
+		n = len(names) if names else 1
+		rows_combo.set(str(n))
+		update_rows()
+
+		# Always use Data Dragon in background threads
+	        # Always use Data Dragon in background threads
 		# Always use Data Dragon in background threads
 		def make_task(index, name):
 			def task():
 				mode = view_mode_var.get()
+				icon_image = None
+				result_icons = {slot: None for slot in returned_fields}
+				result = None
 				try:
-					if mode == 'Cooldown':
-						result = get_champion_cooldowns_dd(name)
-					else:
-						# fetch the champion spells and return descriptions/tooltips
-						result = None
-						mapping, version, _ = load_champion_key_map()
-						lookup_keys = [name.lower(), name.replace(' ', '').lower()]
-						champ_key = None
-						for k in lookup_keys:
-							if k in mapping:
-								champ_key = mapping[k]
+					print(f"[lookup] row={index} name={name} mode={mode}")
+					# resolve champ key
+					mapping, version, _ = load_champion_key_map()
+					lookup_keys = [name.lower(), name.replace(' ', '').lower()]
+					champ_key = None
+					for k in lookup_keys:
+						if k in mapping:
+							champ_key = mapping[k]
+							break
+					if not champ_key:
+						for kname, key in mapping.items():
+							if kname.startswith(name.lower()):
+								champ_key = key
 								break
-						if not champ_key:
-							for kname, key in mapping.items():
-								if kname.startswith(name.lower()):
-									champ_key = key
-									break
-						if champ_key:
-							data = fetch_champion_data(champ_key, version)
-							spells = data.get('spells', [])
-							result = {}
-							slots = ['Q', 'W', 'E', 'R']
-							for i, slot in enumerate(slots):
-								try:
-									spell = spells[i]
+					if champ_key:
+						data = fetch_champion_data(champ_key, version)
+						# champion icon
+						champ_img = (data.get('image') or {}).get('full')
+						if champ_img:
+							try:
+								url = f"{DD_BASE}/{version}/img/champion/{champ_img}"
+								resp = requests.get(url, timeout=5)
+								resp.raise_for_status()
+								im = Image.open(io.BytesIO(resp.content))
+								im = im.resize((48, 48), Image.LANCZOS)
+								icon_image = ImageTk.PhotoImage(im)
+							except Exception:
+								icon_image = None
+						# spells
+						spells = data.get('spells', [])
+						result = {}
+						slots = ['Q', 'W', 'E', 'R']
+						for i, slot in enumerate(slots):
+							val = '-'
+							try:
+								spell = spells[i]
+								if mode == 'Cooldown':
+									val = spell.get('cooldownBurn', '-')
+								else:
 									val = spell.get('tooltip') or spell.get('description') or '-'
-								except Exception:
-									val = '-'
-								result[slot] = val
-				except Exception:
+								img_full = (spell.get('image') or {}).get('full')
+								if img_full:
+									try:
+										url = f"{DD_BASE}/{version}/img/spell/{img_full}"
+										resp = requests.get(url, timeout=5)
+										resp.raise_for_status()
+										im = Image.open(io.BytesIO(resp.content))
+										im = im.resize((32, 32), Image.LANCZOS)
+										result_icons[slot] = ImageTk.PhotoImage(im)
+									except Exception:
+										result_icons[slot] = None
+							except Exception:
+								val = '-'
+							result[slot] = val
+					print(f"[lookup] row={index} result={result}")
+				except Exception as exc:
 					result = None
+					print(f"[lookup:error] row={index} name={name} -> {exc}")
+
 				def apply_result():
-					if result:
-						for i, fld in enumerate(returned_fields):
-							key = fld[0].upper()
-							rows[index]['rvs'][i].set(result.get(key, '-'))
-					else:
-						for v in rows[index]['rvs']:
-							v.set('Champion not found')
-				root.after(0, apply_result)
+					if not root.winfo_exists():
+						return
+					try:
+						print(f"[apply] row={index} result={result}")
+						if result:
+							for i, fld in enumerate(returned_fields):
+								key = fld[0].upper()
+								rows[index]['rvs'][i].set(result.get(key, '-'))
+								img = result_icons.get(key)
+								rows[index]['rv_imgs'][i] = img
+								rows[index]['val_labels'][i].configure(image=img or '')
+						else:
+							for v in rows[index]['rvs']:
+								v.set('Champion not found')
+						if icon_image:
+							rows[index]['icon_img'] = icon_image
+							rows[index]['icon'].configure(image=icon_image)
+						else:
+							rows[index]['icon'].configure(image='')
+					except Exception:
+						# If the UI is already torn down, ignore update
+						pass
+
+				if root.winfo_exists():
+					try:
+						root.after(0, apply_result)
+					except Exception:
+						pass
 			return task
 
 		for idx in range(n):
 			name = rows[idx]['entry'].get().strip()
-			executor.submit(make_task(idx, name))
+			if name and not getattr(rows[idx]['entry'], '_placeholder', False):
+				executor.submit(make_task(idx, name))
 
 
 	# Global buttons
@@ -398,6 +511,7 @@ def main():
 			n = max_rows
 		for idx in range(n):
 			rows[idx]['entry'].delete(0, tk.END)
+			put_placeholder(rows[idx]['entry'])
 			for v in rows[idx]['rvs']:
 				v.set('')
 
