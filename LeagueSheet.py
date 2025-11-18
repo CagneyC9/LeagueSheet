@@ -1,6 +1,7 @@
 
 import os
-import csv
+import sys
+import shutil
 import tkinter as tk
 from tkinter import ttk
 import requests
@@ -22,38 +23,95 @@ def main():
 	y = (sh - h) // 2
 	root.geometry(f"{w}x{h}+{x}+{y}")
 
-	# Read CSV headers (first row) from local CSV if present
-	def default_csv_path():
-		base = os.path.dirname(os.path.abspath(__file__))
-		return os.path.join(base, 'LeagueChampSheet - Sheet1.csv')
+	# We use Data Dragon as the authoritative source for champions/cooldowns.
+	# No CSV dependency is required.
 
-	def read_headers(path):
+	# Prepare a list of champion display names for autocomplete.
+	# Use a per-user writable data directory so packaged exes can update the cache.
+
+	def get_user_data_dir():
+		if os.name == 'nt':
+			base = os.getenv('LOCALAPPDATA') or os.path.expanduser('~\\AppData\\Local')
+		else:
+			base = os.getenv('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
+		path = os.path.join(base, 'LeagueSheet')
 		try:
-			with open(path, newline='', encoding='utf-8') as f:
-				reader = csv.reader(f)
-				return next(reader)
-		except Exception:
-			return []
-
-	headers = read_headers(default_csv_path())
-
-	# Load CSV rows into a dict for lookup by champion_id (lowercased)
-	def load_csv_rows(path):
-		rows = {}
-		try:
-			with open(path, newline='', encoding='utf-8') as f:
-				reader = csv.DictReader(f)
-				for r in reader:
-					key = r.get('champion_id', '').strip().lower()
-					rows[key] = r
+			os.makedirs(path, exist_ok=True)
 		except Exception:
 			pass
-		return rows
+		return path
 
-	csv_rows = load_csv_rows(default_csv_path())
+	def resource_path(rel_path):
+		# When packaged by PyInstaller, resources are in sys._MEIPASS
+		if getattr(sys, 'frozen', False):
+			base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+		else:
+			base = os.path.dirname(os.path.abspath(__file__))
+		return os.path.join(base, rel_path)
 
-	# Prepare a list of champion display names for autocomplete
-	champion_list = sorted({v.get('champion_id', '').strip() for v in csv_rows.values() if v.get('champion_id')}, key=lambda s: s.lower())
+	data_dir = get_user_data_dir()
+	local_list_path = os.path.join(data_dir, 'champions.txt')
+
+	# If the per-user champions cache is missing, try copying a bundled bootstrap.
+	# Look in the bundle root for either `champions.txt` (repo root) or `data/champions.txt`.
+	bundled_champs = resource_path('champions.txt')
+	if not os.path.exists(bundled_champs):
+		bundled_champs = resource_path(os.path.join('data', 'champions.txt'))
+	if not os.path.exists(local_list_path) and os.path.exists(bundled_champs):
+		try:
+			shutil.copyfile(bundled_champs, local_list_path)
+		except Exception:
+			pass
+
+	champion_list = []
+	if os.path.exists(local_list_path):
+		try:
+			with open(local_list_path, encoding='utf-8') as f:
+				champion_list = [line.strip() for line in f if line.strip()]
+		except Exception:
+			champion_list = []
+
+	if not champion_list:
+		# fallback: try to read from DDragon now
+		try:
+			mapping, dd_version, display_names = load_champion_key_map()
+			champion_list = display_names
+		except Exception:
+			champion_list = []
+
+	# status for champion updater (shows local/online update state)
+	status_var = tk.StringVar(value='Champion list: local (cached)')
+
+	# Thread pool for background fetches (create before any submit)
+	executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+	# Start a background task to refresh the local champions file from DDragon
+	def background_update_champion_file():
+		try:
+			# indicate update start in the UI
+			root.after(0, lambda: status_var.set('Updating champion list...'))
+			mapping, version, display_names = load_champion_key_map()
+			# write to local file
+			dirpath = os.path.dirname(local_list_path)
+			os.makedirs(dirpath, exist_ok=True)
+			with open(local_list_path, 'w', encoding='utf-8') as f:
+				for name in display_names:
+					f.write(name + '\n')
+			# update in-memory list on the main thread
+			def apply_update():
+				champion_list[:] = display_names
+				# mark success with version
+				status_var.set(f'Champion list: updated ({version})')
+			root.after(0, apply_update)
+		except Exception:
+			# show failure briefly
+			try:
+				root.after(0, lambda: status_var.set('Champion list: update failed'))
+			except Exception:
+				pass
+
+	# submit the updater but don't block startup
+	executor.submit(background_update_champion_file)
 
 	# --- Data Dragon integration ---
 	# Cache and helper functions to fetch champion cooldowns from ddragon
@@ -74,12 +132,15 @@ def main():
 		r.raise_for_status()
 		data = r.json().get("data", {})
 		mapping = {}
+		display_names = set()
 		for key, info in data.items():
 			name = info.get('id', key)
+			display_names.add(name)
 			mapping[name.lower()] = key
 			mapping[key.lower()] = key
 			mapping[name.replace(' ', '').lower()] = key
-		return mapping, version
+		# return mapping, version, and a sorted list of display names
+		return mapping, version, sorted(display_names, key=lambda s: s.lower())
 
 	@lru_cache(maxsize=256)
 	def fetch_champion_data(key, version, timeout=5):
@@ -92,7 +153,7 @@ def main():
 		name = (champ_input_name or '').strip()
 		if not name:
 			return None
-		mapping, version = load_champion_key_map()
+		mapping, version, _ = load_champion_key_map()
 		lookup_keys = [name.lower(), name.replace(' ', '').lower()]
 		for k in lookup_keys:
 			if k in mapping:
@@ -109,9 +170,6 @@ def main():
 				slots = ["Q", "W", "E", "R"]
 				return {slot: spells[i].get('cooldownBurn', '-') for i, slot in enumerate(slots)}
 		return None
-
-	# Thread pool for background fetches
-	executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 	# Shared autocomplete Listbox (one visible at a time)
 	autocomplete_box = tk.Listbox(root, height=6)
@@ -179,38 +237,13 @@ def main():
 		# small delay to allow clicks into the listbox to register
 		entry.bind('<FocusOut>', lambda e: root.after(150, lambda: autocomplete_box.place_forget()))
 
-	def find_champion(name):
-		if not name:
-			return None
-		key = name.strip().lower()
-		if key in csv_rows:
-			return csv_rows[key]
-		# fallback: startswith
-		for k, v in csv_rows.items():
-			if k.startswith(key):
-				return v
-		return None
-
-	def format_row_for_display(row):
-		# return a readable string of the row excluding champion_id
-		if not row:
-			return ''
-		fields = []
-		for h in headers or []:
-			if h == 'champion_id':
-				continue
-			fields.append(str(row.get(h, '-')))
-		return ' | '.join(fields)
+	# No CSV lookups: DDragon is the authoritative source for champion data.
 
 	frame = ttk.Frame(root, padding=12)
 	frame.pack(fill='both', expand=True)
 
-	# Place header labels above the returned-values columns (one label per CSV column)
-	if headers and len(headers) > 1:
-		returned_fields = [h for h in headers if h != 'champion_id']
-	else:
-		# fallback headers if CSV not found or malformed
-		returned_fields = ['Passive_CD', 'Q_CD', 'W_CD', 'E_CD', 'R_CD']
+	# Returned fields (we use DDragon cooldowns: Passive + Q/W/E/R)
+	returned_fields = ['Passive_CD', 'Q_CD', 'W_CD', 'E_CD', 'R_CD']
 
 	ttk.Label(frame, text='Returned:').grid(row=0, column=2, sticky='w', padx=(0, 6), pady=(0, 6))
 	for i, fld in enumerate(returned_fields):
@@ -231,10 +264,10 @@ def main():
 	rows_combo.set(str(max_rows))
 	rows_combo.pack(side='left', padx=(6, 12))
 
-	# Option: use Data Dragon (online) instead of CSV
-	use_dd_var = tk.BooleanVar(value=False)
-	chk = ttk.Checkbutton(controls_frame, text='Use DDragon', variable=use_dd_var)
-	chk.pack(side='left', padx=(6, 0))
+	# Status label for champion updater
+	ttk.Label(controls_frame, textvariable=status_var).pack(side='left', padx=(8, 0))
+
+	# DDragon is the default source; no CSV toggle required.
 
 	def make_row(index):
 		# index is 0-based logical row index; grid row will be base_row + index
@@ -296,49 +329,36 @@ def main():
 			n = int(rows_combo.get())
 		except Exception:
 			n = max_rows
-		if use_dd_var.get():
-			# use Data Dragon in background threads
-			def make_task(index, name):
-				def task():
-					try:
-						cds = get_champion_cooldowns_dd(name)
-					except Exception:
-						cds = None
-					def apply_result():
-						if cds:
-							# cds contains Q/W/E/R; map into returned_fields positions
-							for i, fld in enumerate(returned_fields):
-								if 'passive' in fld.lower():
-									rows[index]['rvs'][i].set('-')
-								elif fld.upper().startswith('Q'):
-									rows[index]['rvs'][i].set(cds.get('Q', '-'))
-								elif fld.upper().startswith('W'):
-									rows[index]['rvs'][i].set(cds.get('W', '-'))
-								elif fld.upper().startswith('E'):
-									rows[index]['rvs'][i].set(cds.get('E', '-'))
-								elif fld.upper().startswith('R'):
-									rows[index]['rvs'][i].set(cds.get('R', '-'))
-						else:
-							for v in rows[index]['rvs']:
-								v.set('Champion not found')
-					root.after(0, apply_result)
-				return task
+		# Always use Data Dragon in background threads
+		def make_task(index, name):
+			def task():
+				try:
+					cds = get_champion_cooldowns_dd(name)
+				except Exception:
+					cds = None
+				def apply_result():
+					if cds:
+						# cds contains Q/W/E/R; map into returned_fields positions
+						for i, fld in enumerate(returned_fields):
+							if 'passive' in fld.lower():
+								rows[index]['rvs'][i].set('-')
+							elif fld.upper().startswith('Q'):
+								rows[index]['rvs'][i].set(cds.get('Q', '-'))
+							elif fld.upper().startswith('W'):
+								rows[index]['rvs'][i].set(cds.get('W', '-'))
+							elif fld.upper().startswith('E'):
+								rows[index]['rvs'][i].set(cds.get('E', '-'))
+							elif fld.upper().startswith('R'):
+								rows[index]['rvs'][i].set(cds.get('R', '-'))
+					else:
+						for v in rows[index]['rvs']:
+							v.set('Champion not found')
+				root.after(0, apply_result)
+			return task
 
-			for idx in range(n):
-				name = rows[idx]['entry'].get().strip()
-				executor.submit(make_task(idx, name))
-		else:
-			for idx in range(n):
-				val = rows[idx]['entry'].get().strip()
-				row = find_champion(val)
-				if row:
-					# set each returned field into its own label
-					for i, fld in enumerate(returned_fields):
-						v = row.get(fld, '-')
-						rows[idx]['rvs'][i].set(v)
-				else:
-					for v in rows[idx]['rvs']:
-						v.set('Champion not found')
+		for idx in range(n):
+			name = rows[idx]['entry'].get().strip()
+			executor.submit(make_task(idx, name))
 
 
 	# Global buttons
