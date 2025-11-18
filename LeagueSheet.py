@@ -242,22 +242,23 @@ def main():
 	frame = ttk.Frame(root, padding=12)
 	frame.pack(fill='both', expand=True)
 
-	# Returned fields (we use DDragon cooldowns: Passive + Q/W/E/R)
-	returned_fields = ['Passive_CD', 'Q_CD', 'W_CD', 'E_CD', 'R_CD']
+	# Returned fields (we use DDragon cooldowns: Q/W/E/R)
+	returned_fields = ['Q', 'W', 'E', 'R']
 
-	ttk.Label(frame, text='Returned:').grid(row=0, column=2, sticky='w', padx=(0, 6), pady=(0, 6))
+	# Header labels for the spell columns (Q/W/E/R)
+	# Place headers on row 1 so the controls_frame (row 0) does not overlap them
 	for i, fld in enumerate(returned_fields):
-		tk.Label(frame, text=fld).grid(row=0, column=3 + i, sticky='w', padx=(0, 6), pady=(0, 6))
+		tk.Label(frame, text=fld).grid(row=1, column=2 + i, sticky='w', padx=(0, 6), pady=(0, 6))
 
 	# Rows controller: allow selecting 1-5 visible rows
 	rows = []
 	max_rows = 5
-	base_row = 1  # header is at row 0
+	base_row = 2  # header is at row 1
 
-	# Rows selector combobox
+	# Controls row: Champions label + number-of-inputs selector
 	controls_frame = ttk.Frame(frame)
 	controls_frame.grid(row=0, column=0, columnspan=5, sticky='w', pady=(0, 6))
-	ttk.Label(controls_frame, text='Rows:').pack(side='left')
+	tk.Label(controls_frame, text='Champions:').pack(side='left')
 	row_count_var = tk.IntVar(value=max_rows)
 	row_options = [str(i) for i in range(1, max_rows + 1)]
 	rows_combo = ttk.Combobox(controls_frame, values=row_options, width=3, state='readonly')
@@ -265,15 +266,23 @@ def main():
 	rows_combo.pack(side='left', padx=(6, 12))
 
 	# Status label for champion updater
-	ttk.Label(controls_frame, textvariable=status_var).pack(side='left', padx=(8, 0))
+	tk.Label(controls_frame, textvariable=status_var).pack(side='left', padx=(8, 0))
+
+	# View selector: choose whether spell columns show Cooldown or Description
+	view_mode_var = tk.StringVar(value='Cooldown')
+	view_options = ['Cooldown', 'Description']
+	ttk.Label(controls_frame, text='View:').pack(side='left', padx=(8, 0))
+	view_combo = ttk.Combobox(controls_frame, values=view_options, textvariable=view_mode_var, width=12, state='readonly')
+	view_combo.pack(side='left', padx=(4, 12))
 
 	# DDragon is the default source; no CSV toggle required.
 
 	def make_row(index):
 		# index is 0-based logical row index; grid row will be base_row + index
 		grid_row = base_row + index
-		lbl_in = ttk.Label(frame, text=f'Input {index+1}:')
-		lbl_in.grid(row=grid_row, column=0, sticky='w', padx=(0, 6), pady=6)
+		# per-row 'Name:' label and champion entry
+		lbl_name = ttk.Label(frame, text='Name:')
+		lbl_name.grid(row=grid_row, column=0, sticky='w', padx=(0, 6), pady=6)
 		e = ttk.Entry(frame, width=36)
 		e.grid(row=grid_row, column=1, padx=(0, 6), pady=6)
 
@@ -282,20 +291,18 @@ def main():
 
 		rv = tk.StringVar(value='')
 
-		lbl_out = ttk.Label(frame, text='Returned:')
-		lbl_out.grid(row=grid_row, column=2, sticky='w')
-
 		# create one label per returned field so headers align with values
 		val_labels = []
 		rvs = []
 		for i in range(len(returned_fields)):
 			v = tk.StringVar(value='')
-			lbl = ttk.Label(frame, textvariable=v, width=18)
-			lbl.grid(row=grid_row, column=3 + i, sticky='w')
+			# allow wider labels to accommodate descriptions
+			lbl = ttk.Label(frame, textvariable=v, width=40, anchor='w')
+			lbl.grid(row=grid_row, column=2 + i, sticky='w')
 			val_labels.append(lbl)
 			rvs.append(v)
 
-		rows.append({'label': lbl_in, 'entry': e, 'out_label': lbl_out, 'val_labels': val_labels, 'rvs': rvs})
+		rows.append({'label': lbl_name, 'entry': e, 'val_labels': val_labels, 'rvs': rvs})
 
 	# create all rows (they will be shown/hidden by update_rows)
 	for i in range(max_rows):
@@ -311,16 +318,15 @@ def main():
 				# show
 				r['label'].grid()
 				r['entry'].grid()
-				r['out_label'].grid()
 				for lbl in r['val_labels']:
 					lbl.grid()
 			else:
 				# hide
 				r['label'].grid_remove()
 				r['entry'].grid_remove()
-				r['out_label'].grid_remove()
 				for lbl in r['val_labels']:
 					lbl.grid_remove()
+				# show/hide per-row label, entry, and value labels
 
 	rows_combo.bind('<<ComboboxSelected>>', update_rows)
 
@@ -332,24 +338,44 @@ def main():
 		# Always use Data Dragon in background threads
 		def make_task(index, name):
 			def task():
+				mode = view_mode_var.get()
 				try:
-					cds = get_champion_cooldowns_dd(name)
+					if mode == 'Cooldown':
+						result = get_champion_cooldowns_dd(name)
+					else:
+						# fetch the champion spells and return descriptions/tooltips
+						result = None
+						mapping, version, _ = load_champion_key_map()
+						lookup_keys = [name.lower(), name.replace(' ', '').lower()]
+						champ_key = None
+						for k in lookup_keys:
+							if k in mapping:
+								champ_key = mapping[k]
+								break
+						if not champ_key:
+							for kname, key in mapping.items():
+								if kname.startswith(name.lower()):
+									champ_key = key
+									break
+						if champ_key:
+							data = fetch_champion_data(champ_key, version)
+							spells = data.get('spells', [])
+							result = {}
+							slots = ['Q', 'W', 'E', 'R']
+							for i, slot in enumerate(slots):
+								try:
+									spell = spells[i]
+									val = spell.get('tooltip') or spell.get('description') or '-'
+								except Exception:
+									val = '-'
+								result[slot] = val
 				except Exception:
-					cds = None
+					result = None
 				def apply_result():
-					if cds:
-						# cds contains Q/W/E/R; map into returned_fields positions
+					if result:
 						for i, fld in enumerate(returned_fields):
-							if 'passive' in fld.lower():
-								rows[index]['rvs'][i].set('-')
-							elif fld.upper().startswith('Q'):
-								rows[index]['rvs'][i].set(cds.get('Q', '-'))
-							elif fld.upper().startswith('W'):
-								rows[index]['rvs'][i].set(cds.get('W', '-'))
-							elif fld.upper().startswith('E'):
-								rows[index]['rvs'][i].set(cds.get('E', '-'))
-							elif fld.upper().startswith('R'):
-								rows[index]['rvs'][i].set(cds.get('R', '-'))
+							key = fld[0].upper()
+							rows[index]['rvs'][i].set(result.get(key, '-'))
 					else:
 						for v in rows[index]['rvs']:
 							v.set('Champion not found')
@@ -362,7 +388,7 @@ def main():
 
 
 	# Global buttons
-	btn_all = ttk.Button(frame, text='Return All', command=return_all)
+	btn_all = ttk.Button(frame, text='Lookup', command=return_all)
 	btn_all.grid(row=base_row + max_rows + 1, column=4, sticky='e', pady=(12, 0))
 
 	def clear_all():
@@ -375,7 +401,7 @@ def main():
 			for v in rows[idx]['rvs']:
 				v.set('')
 
-	btn_clear = ttk.Button(frame, text='Clear All', command=clear_all)
+	btn_clear = ttk.Button(frame, text='Clear', command=clear_all)
 	btn_clear.grid(row=base_row + max_rows + 1, column=3, sticky='e', pady=(12, 0))
 
 	# Ensure initial visibility matches combobox

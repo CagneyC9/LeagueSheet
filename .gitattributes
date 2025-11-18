@@ -7,8 +7,7 @@ build/* linguist-vendored
 dist/* linguist-vendored
 __pycache__/* linguist-vendored
 
-# Ignore CSV files from language detection
-*.csv linguist-vendored
+# (CSV removed from repo) Previously ignored CSV files are no longer present.
 
 # Ignore any TeX or HTML-like false positives
 *.tex linguist-detectable=false
