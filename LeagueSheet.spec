@@ -5,7 +5,7 @@ a = Analysis(
     ['LeagueSheet.py'],
     pathex=[],
     binaries=[],
-    datas=[('data/champions.txt', 'data')],
+    datas=[('data/champions.txt', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

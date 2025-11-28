@@ -9,22 +9,231 @@ import concurrent.futures
 from functools import lru_cache
 from PIL import Image, ImageTk
 import io
+import ctypes
+from ctypes import wintypes
+import threading
+
+
 
 
 def main():
-	# Entry point for the LeagueSheet demo UI.
+	def resource_path(relative_path):
+		"""Get absolute path to resource, works for dev and PyInstaller."""
+		try:
+			base_path = sys._MEIPASS
+		except Exception:
+			base_path = os.path.abspath(".")
+		return os.path.join(base_path, relative_path)
+    	
 	root = tk.Tk()
 	root.title('LeagueSheet - 5 Inputs Demo')
-
-	# Set window size as percentage of the screen (60% width x 60% height)
+ 
 	sw = root.winfo_screenwidth()
 	sh = root.winfo_screenheight()
-	w = int(sw * 0.60)
-	h = int(sh * 0.60)
-	# Center the window on the screen
-	x = (sw - w) // 2
-	y = (sh - h) // 2
-	root.geometry(f"{w}x{h}+{x}+{y}")
+	size_by_rows = {1: 0.72, 2: 0.66, 3: 0.6, 4: 0.56, 5: 0.52}
+	perc_w = 0.6
+	min_w, min_h = 500, 420
+	hk_input_var = tk.StringVar(value='Ctrl+Shift+L')
+	hotkey_event_binding = None
+	hotkey_status = tk.StringVar(value='Hotkey: Ctrl+Shift+L')
+	global_hotkey_registered = False
+	hotkey_thread = None
+	hotkey_thread_stop = None
+	hotkey_thread_id = None
+	HOTKEY_ID = 1
+	auto_geometry = True   # stop auto-sizing once the user manually resizes
+	applying_geometry = False
+	root.minsize(min_w, min_h)
+ 
+	def set_hotkey_status(text):
+		try:
+			root.after(0, lambda t=text: hotkey_status.set(t))
+		except Exception:
+			pass
+ 
+	def parse_hotkey(text):
+		# Parse strings like "Ctrl+Shift+L" -> (tk_event, mod_mask, vk_code)
+		parts = [p.strip() for p in (text or '').replace('-', '+').split('+') if p.strip()]
+		if not parts:
+			return None
+		mod_map = {
+			'ctrl': 0x0002,
+			'control': 0x0002,
+			'shift': 0x0004,
+			'alt': 0x0001,
+			'win': 0x0008,
+			'windows': 0x0008,
+		}
+		mods = []
+		mod_mask = 0
+		key = None
+		for p in parts:
+			lp = p.lower()
+			if lp in mod_map:
+				if mod_map[lp] not in mods:
+					mods.append(mod_map[lp])
+					mod_mask |= mod_map[lp]
+			else:
+				key = p
+		if not key:
+			return None
+		key_upper = key.upper()
+		event_mods = []
+		if 0x0002 in mods:
+			event_mods.append('Control')
+		if 0x0004 in mods:
+			event_mods.append('Shift')
+		if 0x0001 in mods:
+			event_mods.append('Alt')
+		if 0x0008 in mods:
+			event_mods.append('Win')
+		event_key = key_upper
+		if len(event_key) == 1:
+			vk_code = ord(event_key)
+		elif key_upper.startswith('F') and key_upper[1:].isdigit():
+			num = int(key_upper[1:])
+			if 1 <= num <= 24:
+				vk_code = 0x70 + (num - 1)
+			else:
+				return None
+			event_key = f'F{num}'
+		else:
+			return None
+		tk_event = f"<{'-'.join(event_mods + [event_key])}>"
+		return tk_event, mod_mask, vk_code
+ 
+	def toggle_window(event=None):
+		# Toggle between minimized and restored, lifting to the front when shown.
+		try:
+			if root.state() in ('normal', 'zoomed'):
+				root.iconify()
+			else:
+				root.deiconify()
+				root.lift()
+				root.focus_force()
+				root.attributes('-topmost', True)
+				root.after(50, lambda: root.attributes('-topmost', False))
+		except Exception:
+			pass
+		return "break"
+ 
+	def stop_hotkey_thread():
+		nonlocal hotkey_thread, hotkey_thread_stop, hotkey_thread_id, global_hotkey_registered
+		if hotkey_thread and hotkey_thread.is_alive():
+			try:
+				if hotkey_thread_id:
+					ctypes.windll.user32.PostThreadMessageW(hotkey_thread_id, 0x0012, 0, 0)  # WM_QUIT
+			except Exception:
+				pass
+			if hotkey_thread_stop:
+				hotkey_thread_stop.set()
+			hotkey_thread.join(timeout=1)
+		hotkey_thread = None
+		hotkey_thread_stop = None
+		hotkey_thread_id = None
+		global_hotkey_registered = False
+		set_hotkey_status('Hotkey: unregistered')
+ 
+	def register_global_hotkey(mod_mask, vk_code):
+		# Windows-only global hotkey so toggle works even when minimized/unfocused.
+		nonlocal global_hotkey_registered, hotkey_thread, hotkey_thread_stop, hotkey_thread_id
+		if os.name != 'nt':
+			return
+		stop_hotkey_thread()
+		hotkey_thread_stop = threading.Event()
+ 
+		def message_loop():
+			nonlocal global_hotkey_registered, hotkey_thread_id
+			user32 = ctypes.windll.user32
+			kernel32 = ctypes.windll.kernel32
+			hotkey_thread_id = kernel32.GetCurrentThreadId()
+			try:
+				if not user32.RegisterHotKey(None, HOTKEY_ID, mod_mask, vk_code):
+					set_hotkey_status('Hotkey: failed to register')
+					global_hotkey_registered = False
+					return
+				global_hotkey_registered = True
+				set_hotkey_status('Hotkey: registered')
+				msg = wintypes.MSG()
+				while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+					if hotkey_thread_stop.is_set():
+						break
+					if msg.message == 0x0312 and msg.wParam == HOTKEY_ID:
+						try:
+							root.after(0, toggle_window)
+						except Exception:
+							pass
+					user32.TranslateMessage(ctypes.byref(msg))
+					user32.DispatchMessageW(ctypes.byref(msg))
+			finally:
+				try:
+					user32.UnregisterHotKey(None, HOTKEY_ID)
+				except Exception:
+					pass
+				global_hotkey_registered = False
+				set_hotkey_status('Hotkey: unregistered')
+ 
+		hotkey_thread = threading.Thread(target=message_loop, daemon=True)
+		hotkey_thread.start()
+ 
+	def unregister_global_hotkey():
+		stop_hotkey_thread()
+ 
+	def apply_hotkey(text):
+		nonlocal hotkey_event_binding
+		parsed = parse_hotkey(text)
+		if not parsed:
+			set_hotkey_status('Hotkey: invalid')
+			return
+		tk_event, mod_mask, vk_code = parsed
+		if hotkey_event_binding:
+			try:
+				root.unbind(hotkey_event_binding)
+			except Exception:
+				pass
+		try:
+			root.bind(tk_event, toggle_window)
+			hotkey_event_binding = tk_event
+		except Exception:
+			set_hotkey_status('Hotkey: failed to bind')
+			return
+		unregister_global_hotkey()
+		register_global_hotkey(mod_mask, vk_code)
+		set_hotkey_status(f'Hotkey: {text}')
+		hk_input_var.set(text)
+ 
+	def on_close():
+		unregister_global_hotkey()
+		try:
+			root.destroy()
+		except Exception:
+			pass
+ 
+
+	root.protocol("WM_DELETE_WINDOW", on_close)
+	apply_hotkey(hk_input_var.get())
+
+	def set_geometry_for_rows(n_rows):
+		nonlocal auto_geometry, applying_geometry
+		if not auto_geometry:
+			return
+		perc_h = size_by_rows.get(n_rows, size_by_rows.get(max(size_by_rows), 0.6))
+		w = max(min_w, int(sw * perc_w))
+		h = max(min_h, int(sh * perc_h))
+		x = (sw - w) // 2
+		y = (sh - h) // 2
+		applying_geometry = True
+		root.geometry(f"{w}x{h}+{x}+{y}")
+		applying_geometry = False
+
+	def on_root_configure(event):
+		# When the user manually resizes the window, stop auto geometry changes.
+		nonlocal auto_geometry, applying_geometry
+		if applying_geometry:
+			return
+		auto_geometry = False
+
+	root.bind('<Configure>', on_root_configure)
 
 	# We use Data Dragon as the authoritative source for champions/cooldowns.
 	# No CSV dependency is required.
@@ -43,20 +252,19 @@ def main():
 		except Exception:
 			pass
 		return path
+ 
+	# Set up the main frame to fill the window
+	frame = ttk.Frame(root, padding=12)
+	frame.pack(fill='both', expand=True)
 
-	def resource_path(rel_path):
-		# When packaged by PyInstaller, resources are in sys._MEIPASS
-		if getattr(sys, 'frozen', False):
-			base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-		else:
-			base = os.path.dirname(os.path.abspath(__file__))
-		return os.path.join(base, rel_path)
-
+	# Prepare a list of champion display names for autocomplete.
 	data_dir = get_user_data_dir()
 	local_list_path = os.path.join(data_dir, 'champions.txt')
+	champion_list = []
 
 	# If the per-user champions cache is missing, try copying a bundled bootstrap.
 	# Look in the bundle root for either `champions.txt` (repo root) or `data/champions.txt`.
+
 	bundled_champs = resource_path('champions.txt')
 	if not os.path.exists(bundled_champs):
 		bundled_champs = resource_path(os.path.join('data', 'champions.txt'))
@@ -66,16 +274,14 @@ def main():
 		except Exception:
 			pass
 
-	champion_list = []
+	frame['padding'] = 12
 	if os.path.exists(local_list_path):
 		try:
 			with open(local_list_path, encoding='utf-8') as f:
 				champion_list = [line.strip() for line in f if line.strip()]
 		except Exception:
 			champion_list = []
-
 	if not champion_list:
-		# fallback: try to read from DDragon now
 		try:
 			mapping, dd_version, display_names = load_champion_key_map()
 			champion_list = display_names
@@ -84,11 +290,9 @@ def main():
 
 	# status for champion updater (shows local/online update state)
 	status_var = tk.StringVar(value='Champion list: local (cached)')
-
 	# Thread pool for background fetches (create before any submit)
 	executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
-	# Start a background task to refresh the local champions file from DDragon
 	def background_update_champion_file():
 		try:
 			# indicate update start in the UI
@@ -252,9 +456,6 @@ def main():
 
 	# No CSV lookups: DDragon is the authoritative source for champion data.
 
-	frame = ttk.Frame(root, padding=12)
-	frame.pack(fill='both', expand=True)
-
 	PLACEHOLDER_TEXT = 'Select champion'
 
 	def put_placeholder(entry):
@@ -303,6 +504,12 @@ def main():
 	ttk.Label(controls_frame, text='View:').pack(side='left', padx=(8, 0))
 	view_combo = ttk.Combobox(controls_frame, values=view_options, textvariable=view_mode_var, width=12, state='readonly')
 	view_combo.pack(side='left', padx=(4, 12))
+	# Hotkey controls: allow user to set the toggle shortcut
+	ttk.Label(controls_frame, text='Hotkey:').pack(side='left', padx=(4, 0))
+	hotkey_entry = ttk.Entry(controls_frame, textvariable=hk_input_var, width=14)
+	hotkey_entry.pack(side='left', padx=(4, 4))
+	ttk.Button(controls_frame, text='Set', command=lambda: apply_hotkey(hk_input_var.get())).pack(side='left', padx=(2, 6))
+	tk.Label(controls_frame, textvariable=hotkey_status).pack(side='left')
 
 	# DDragon is the default source; no CSV toggle required.
 
@@ -364,6 +571,7 @@ def main():
 				for lbl in r['val_labels']:
 					lbl.grid_remove()
 				# show/hide per-row label, entry, and value labels
+		set_geometry_for_rows(n)
 
 	rows_combo.bind('<<ComboboxSelected>>', update_rows)
 

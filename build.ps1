@@ -19,7 +19,7 @@ Write-Host "Building LeagueSheet.exe with PyInstaller (bundling champions.txt at
 python -m pip install --upgrade pip; pip install -r requirements.txt pyinstaller
 
 # Build: bundle `champions.txt` from repo root into the bundle root so the app can find it.
-pyinstaller --noconfirm --onefile --windowed --add-data "champions.txt;." --name LeagueSheet LeagueSheet.py
+pyinstaller --noconfirm --onefile --windowed --add-data "data/champions.txt;." --name LeagueSheet LeagueSheet.py
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Build complete. Artifact in: dist\LeagueSheet.exe (or dist\LeagueSheet\LeagueSheet.exe for one-dir)." -ForegroundColor Green
